@@ -1,0 +1,12 @@
+# linkrec dependencies (verified 2026-11-16, Python 3.14)
+# torch is reused from the host's CUDA 2.14 env via .venv/lib/python3.14/site-packages/hermes-torch.pth
+# (point it at the site-packages dir containing torch 2.14.0+cu130; do NOT pip install torch here
+# unless you want a ~3 GB download).
+torch-geometric==2.8.1
+recbole==1.2.0
+kmeans_pytorch  # required: recbole imports it unconditionally (LDiffRec)
+fastapi
+uvicorn
+# recbole 1.2.0 needs numpy/scipy/pandas/scikit-learn (already present on this host);
+# it is NOT fully compatible with numpy>=2.0 / scipy>=1.14 out of the box -
+# scripts/train_recsys.py installs the required shims at import time.

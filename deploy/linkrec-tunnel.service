@@ -1,0 +1,15 @@
+[Unit]
+Description=Cloudflare quick tunnel for linkrec (127.0.0.1:8620)
+After=network-online.target linkrec.service
+Wants=linkrec.service
+
+[Service]
+Type=simple
+ExecStart=/home/coreys/.dsh/mobile-access-desktop/components/cloudflared/2026.9.1/cloudflared tunnel --url http://127.0.0.1:8620 --no-autoupdate --logfile /home/coreys/Projects/linkrec/logs/cloudflared.log
+Restart=on-failure
+RestartSec=10
+User=coreys
+Environment=HOME=/home/coreys
+
+[Install]
+WantedBy=multi-user.target

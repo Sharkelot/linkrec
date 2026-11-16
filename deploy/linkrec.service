@@ -1,0 +1,15 @@
+[Unit]
+Description=linkrec — embeddings & link prediction (FastAPI on 127.0.0.1:8620)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/coreys/Projects/linkrec
+ExecStart=/home/coreys/Projects/linkrec/.venv/bin/python -m uvicorn serve.app:app --host 127.0.0.1 --port 8620 --log-level info
+Restart=on-failure
+RestartSec=5
+User=coreys
+Environment=HOME=/home/coreys
+
+[Install]
+WantedBy=multi-user.target
