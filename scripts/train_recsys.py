@@ -41,6 +41,7 @@ Outputs (outputs/):
   recsys_split_manifest.json - per-user split sizes + raw-ts bounds (audit)
 """
 import json
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -63,7 +64,7 @@ OUT = ROOT / "outputs"
 OUT.mkdir(exist_ok=True)
 RAW_ZIP = ROOT / "data" / "ml-100k-raw.zip"
 
-SEED = 42
+SEED = int(os.environ.get("LINKREC_SEED", "42"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CONFIG = {
@@ -179,6 +180,8 @@ def audit_splits(config, dataset, train_data, valid_data, test_data):
 
 
 def main():
+    # bit-level reproducibility (also pins any torch ops RecBole touches)
+    torch.use_deterministic_algorithms(True)
     t0 = time.time()
     init_seed(SEED, True)
     print(f"[config] model=LightGCN device={DEVICE} split=TO/RS[0.8,0.1,0.1] group_by=user")

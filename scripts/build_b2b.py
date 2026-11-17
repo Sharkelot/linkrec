@@ -28,6 +28,7 @@ Outputs:
   outputs/b2b_meta.json  - sector/region names, counts, density
 """
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -36,7 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
 OUT.mkdir(exist_ok=True)
 
-SEED = 42
+SEED = int(os.environ.get("LINKREC_SEED", "42"))
 N = 3000
 N_SECTORS = 12
 N_REGIONS = 16

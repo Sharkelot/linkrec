@@ -27,6 +27,7 @@ Outputs (outputs/):
   linkpred_data.pt           - x, edge splits, node labels (for serving)
 """
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -36,7 +37,8 @@ import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.nn import SAGEConv
 
-from eval_common import (full_rank_recall, sample_neg_excluding)
+from eval_common import (full_rank_recall, sample_class_negatives,
+                         sample_neg_excluding)
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
@@ -44,7 +46,7 @@ DATA = ROOT / "data"
 OUT.mkdir(exist_ok=True)
 DATA.mkdir(exist_ok=True)
 
-SEED = 42
+SEED = int(os.environ.get("LINKREC_SEED", "42"))
 HIDDEN = 128
 EPOCHS = 80
 LR = 1e-3
@@ -96,28 +98,6 @@ def score_pairs(emb, src, dst):
     return F.cosine_similarity(emb[src], emb[dst], dim=-1)
 
 
-def sample_negatives(src, dst, y, pools, adj, n, device, gen):
-    """For each (src, dst): n hard negatives = same class as dst,
-    excluding dst, src, and src's (training) neighbors.
-    Falls back to uniform random if the pool is exhausted."""
-    n_hard = []
-    for i in range(dst.size(0)):
-        u, v = int(src[i]), int(dst[i])
-        pool = pools[int(y[v])]
-        excl = adj[u] | torch.zeros_like(adj[u])
-        excl[v] = True
-        excl[u] = True
-        cand = pool[~excl[pool]]
-        take = min(n, cand.size(0))
-        if take > 0:
-            idx = torch.randperm(cand.size(0), device=device, generator=gen)[:take]
-            n_hard.append(cand[idx])
-        if take < n:  # top up with uniform
-            extra = torch.randint(0, adj.size(0), (n - take,), device=device, generator=gen)
-            n_hard.append(extra)
-    return torch.cat(n_hard).view(-1, n)
-
-
 def sampled_mrr_auc(pos_scores, neg_scores):
     """MRR and AUC from per-edge positive score vs K negative scores."""
     K = neg_scores.size(1)
@@ -129,6 +109,9 @@ def sampled_mrr_auc(pos_scores, neg_scores):
 
 
 def main():
+    # bit-level reproducibility: PyG scatter on CUDA is atomic-based and
+    # otherwise drifts ~1e-4 run to run; deterministic mode pins the kernels
+    torch.use_deterministic_algorithms(True)
     torch.manual_seed(SEED)
     rng = random.Random(SEED)
     gen = torch.Generator(device=DEVICE).manual_seed(SEED)
@@ -171,8 +154,8 @@ def main():
         # (same class); cat along dim=1 so each edge keeps ITS OWN negatives
         neg_uniform = sample_neg_excluding(train_idx[0], train_idx[1], adj,
                                            NEG_K, gen, N)
-        neg_hard = sample_negatives(train_idx[0], train_idx[1], y, pools,
-                                    adj, NEG_K, DEVICE, gen)
+        neg_hard = sample_class_negatives(train_idx[0], train_idx[1], y[train_idx[1]],
+                                          pools, adj, NEG_K, gen, N)
         neg_src = train_idx[0].repeat_interleave(2 * NEG_K)
         neg_dst = torch.cat([neg_uniform, neg_hard], dim=1).view(-1)
         neg = score_pairs(emb, neg_src, neg_dst)
@@ -198,8 +181,8 @@ def main():
             pos_scores, score_pairs(emb, held[0].repeat_interleave(EVAL_NEGS),
                                     neg_uniform.view(-1)).cpu().view(-1, EVAL_NEGS))
 
-        neg_hard = sample_negatives(held[0], held[1], y, pools, adj,
-                                    EVAL_NEGS, DEVICE, gen)
+        neg_hard = sample_class_negatives(held[0], held[1], y[held[1]],
+                                          pools, adj, EVAL_NEGS, gen, N)
         mrr_hard, auc_hard = sampled_mrr_auc(
             pos_scores, score_pairs(emb, held[0].repeat_interleave(EVAL_NEGS),
                                     neg_hard.view(-1)).cpu().view(-1, EVAL_NEGS))
@@ -226,7 +209,8 @@ def main():
             known[tri[0], tri[1]] | dup[tri[0], tri[1]], float("-inf"))
         n_dup_excluded = int((dup[tri[0], tri[1]] & ~known[tri[0], tri[1]]).sum().item())
         topk = min(TOP_K, int((~cand_flat.isinf()).sum().item()))
-        vals, idx = torch.topk(cand_flat, topk)
+        tie = torch.arange(cand_flat.numel(), device=DEVICE, dtype=cand_flat.dtype) * 1e-9
+        vals, idx = torch.topk(cand_flat + tie, topk)
         top_pairs = [(int(tri[0][idx[j]]), int(tri[1][idx[j]]), float(vals[j]))
                      for j in range(topk)]
 

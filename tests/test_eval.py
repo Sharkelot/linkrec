@@ -2,10 +2,12 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from eval_common import (auc_rank, full_rank_recall, precision_at_k,
+                         sample_class_negatives, sample_neg_excluding,
                          sampled_mrr_auc)  # noqa: E402
 
 
@@ -86,3 +88,113 @@ def test_precision_at_k_perfect():
     p = precision_at_k(sim, cand, latent, (1, 2, 3))
     assert p["precision@1"] == 1.0 and p["precision@2"] == 1.0
     assert abs(p["precision@3"] - 2 / 3) < 1e-6
+
+
+# ------------------------------------------------------------------ samplers
+def _assert_negatives_valid(out, src, dst, adj, K):
+    """Core invariant: no candidate is src itself, the positive dst, or a
+    train-graph neighbor of src."""
+    assert out.shape == (src.numel(), K)
+    assert bool((out != src.unsqueeze(1)).all()), "self-pair in negatives"
+    assert bool((out != dst.unsqueeze(1)).all()), "positive dst in negatives"
+    assert bool((~adj[src.unsqueeze(1).expand_as(out), out]).all()), \
+        "train neighbor in negatives (false negative)"
+
+
+def test_sample_neg_excluding_invariants_sparse_graph():
+    N, m, K = 200, 500, 10
+    g = torch.Generator().manual_seed(0)
+    adj = (torch.rand(N, N, generator=g) < 0.15).to(torch.bool)
+    adj = adj | adj.T
+    src = torch.randint(0, N, (m,), generator=g)
+    dst = torch.randint(0, N, (m,), generator=g)
+    out = sample_neg_excluding(src, dst, adj, K, g, N)
+    _assert_negatives_valid(out, src, dst, adj, K)
+
+
+def test_sample_neg_excluding_invariants_dense_graph():
+    """Dense graph (60% edges): stochastic rounds often fail, so this
+    exercises the explicit-valid top-up path (never an unrestricted
+    randint fallback)."""
+    N, m, K = 200, 500, 10
+    g = torch.Generator().manual_seed(1)
+    adj = (torch.rand(N, N, generator=g) < 0.6).to(torch.bool)
+    adj = adj | adj.T
+    src = torch.randint(0, N, (m,), generator=g)
+    dst = torch.randint(0, N, (m,), generator=g)
+    out = sample_neg_excluding(src, dst, adj, K, g, N, rounds=2)
+    _assert_negatives_valid(out, src, dst, adj, K)
+
+
+def test_sample_neg_excluding_raises_when_too_few_valid():
+    """Complete graph: zero valid nodes for any row -> must raise, not
+    silently return an invalid candidate."""
+    N = 12
+    adj = torch.ones(N, N, dtype=torch.bool)
+    src = torch.tensor([0])
+    dst = torch.tensor([1])
+    with pytest.raises(RuntimeError):
+        sample_neg_excluding(src, dst, adj, 5, torch.Generator(), N, rounds=2)
+
+
+def test_sample_class_negatives_invariants():
+    """Hard negatives: exclusions ALWAYS hold; when the class pool has
+    enough valid members, every candidate comes from the dst's class."""
+    N, m, K = 300, 400, 10
+    g = torch.Generator().manual_seed(2)
+    cls = torch.randint(0, 3, (N,), generator=g)
+    pools = [torch.nonzero(cls == c).squeeze(1).contiguous() for c in range(3)]
+    adj = (torch.rand(N, N, generator=g) < 0.2).to(torch.bool)
+    adj = adj | adj.T
+    src = torch.randint(0, N, (m,), generator=g)
+    dst = torch.randint(0, N, (m,), generator=g)
+    out = sample_class_negatives(src, dst, cls[dst], pools, adj, K, g, N)
+    _assert_negatives_valid(out, src, dst, adj, K)
+    # class membership where the pool has >= K+2 valid members
+    in_cls = torch.zeros(N, N, dtype=torch.bool)
+    for c, p in enumerate(pools):
+        in_cls[:, c] = False
+        in_cls[p, c] = True
+    dst_cls = cls[dst]
+    pool_valid_count = torch.zeros(m, dtype=torch.long)
+    for i in range(m):
+        u, v = int(src[i]), int(dst[i])
+        mask = ~adj[u]
+        mask[v] = False
+        mask[u] = False
+        pool = pools[int(dst_cls[i])]
+        pool_valid_count[i] = int(mask[pool].sum().item())
+    enough = pool_valid_count >= K + 2
+    for i in torch.nonzero(enough).squeeze(1).tolist():
+        for c in out[i].tolist():
+            assert bool(in_cls[c, dst_cls[i]]), "candidate outside dst class"
+
+
+def test_sample_class_negatives_empty_pool_fallback_still_valid():
+    """Rows whose class pool is empty fall back to uniform-over-all WITH
+    the same exclusions (never an unrestricted draw)."""
+    N, K = 100, 10
+    g = torch.Generator().manual_seed(3)
+    # two classes, class 1 empty
+    cls = torch.zeros(N, dtype=torch.long)
+    pools = [torch.arange(1, N), torch.empty(0, dtype=torch.long)]
+    adj = (torch.rand(N, N, generator=g) < 0.3).to(torch.bool)
+    adj = adj | adj.T
+    src = torch.randint(0, N, (200,), generator=g)
+    dst = torch.ones(200, dtype=torch.long)  # dst in empty class 1
+    out = sample_class_negatives(src, dst, cls[dst], pools, adj, K, g, N)
+    _assert_negatives_valid(out, src, dst, adj, K)
+
+
+def test_topup_path_forced_by_high_neighbor_fraction():
+    """85% neighbor fraction: stochastic rounds almost never fill K valid
+    candidates, so nearly every row goes through the explicit-valid
+    enumeration top-up. Invariants must still hold."""
+    N, m, K = 120, 300, 8
+    g = torch.Generator().manual_seed(4)
+    adj = (torch.rand(N, N, generator=g) < 0.425).to(torch.bool)
+    adj = adj | adj.T
+    src = torch.randint(0, N, (m,), generator=g)
+    dst = torch.randint(0, N, (m,), generator=g)
+    out = sample_neg_excluding(src, dst, adj, K, g, N, rounds=3)
+    _assert_negatives_valid(out, src, dst, adj, K)

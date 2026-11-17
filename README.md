@@ -35,13 +35,13 @@ tracking and a local-LLM `/explain` endpoint.
 
 | model | AUC (uniform negs) | MRR (uniform) | AUC (hard same-topic) | MRR (hard) | R@1 | R@5 | R@10 | R@20 |
 |---|---|---|---|---|---|---|---|---|
-| GraphSAGE (trained) | 0.7946 | 0.3521 | **0.7781** | 0.2675 | 0.050 | 0.138 | 0.190 | 0.246 |
-| feature cosine (no graph) | **0.8028** | 0.3523 | 0.7399 | 0.2474 | 0.064 | 0.135 | 0.182 | 0.234 |
-| Adamic-Adar (common nbrs) | 0.6939 | **0.8162** | 0.6763 | **0.6423** | **0.112** | **0.258** | **0.322** | **0.349** |
+| GraphSAGE (trained) | 0.7966 | 0.3498 | **0.7793** | 0.2693 | 0.050 | 0.137 | 0.193 | 0.256 |
+| feature cosine (no graph) | **0.8028** | 0.3523 | 0.7417 | 0.2656 | 0.064 | 0.135 | 0.182 | 0.234 |
+| Adamic-Adar (common nbrs) | 0.6939 | **0.8162** | 0.6760 | **0.6514** | **0.112** | **0.258** | **0.322** | **0.349** |
 
-Read (v2, corrected protocol): with edge-excluding negative sampling and
+Read (v3, corrected protocol): with edge-excluding negative sampling and
 bidirectional message passing, the GNN's AUC edge over raw feature cosine
-mostly disappears on Cora (0.795 vs 0.803) — feature-level topic similarity
+mostly disappears on Cora (0.797 vs 0.803) — feature-level topic similarity
 is a very strong signal on this graph. Correct Adamic-Adar is the strongest
 full-ranking top-k locator here (R@10 0.322, R@1 0.112). Full-ranking
 Recall@k (no negative sampling) is the most robust column; sampled MRR
@@ -70,37 +70,64 @@ affinity vector **z** (unobserved). 20% of the true edges are held out as
 
 | model | regime | AUC (full) | P@1 | P@10 | P@100 | R@10 |
 |---|---|---|---|---|---|---|
-| **pair ranker (rel.-feature MLP)** | observable | **0.644** | 0.000 | **0.300** | 0.110 | 0.023 |
-| Adamic-Adar | observable | 0.611 | 0.000 | 0.000 | 0.130 | 0.013 |
-| feature cosine | observable | 0.590 | 1.000 | 0.200 | **0.150** | **0.024** |
-| GraphSAGE cosine | observable | 0.586 | 0.000 | 0.300 | 0.140 | 0.022 |
-| pair ranker | unlearnable (control) | 0.589 | 0.000 | 0.000 | 0.020 | 0.013 |
-| feature cosine | unlearnable (control) | 0.551 | 0.000 | 0.000 | 0.020 | 0.013 |
-| GraphSAGE cosine | unlearnable (control) | 0.522 | 0.000 | 0.000 | 0.010 | 0.006 |
+| **pair ranker (rel.-feature MLP)** | observable | **0.644** | 0.000 | 0.300 | 0.110 | 0.023 |
+| Adamic-Adar | observable | 0.611 | 0.000 | 0.000 | 0.140 | 0.013 |
+| feature cosine | observable | 0.590 | 0.000 | **0.500** | **0.180** | **0.024** |
+| GraphSAGE cosine | observable | 0.577 | 0.000 | 0.100 | **0.180** | 0.018 |
+| pair ranker | unlearnable (control) | 0.590 | 0.000 | 0.000 | 0.040 | 0.013 |
+| feature cosine | unlearnable (control) | 0.551 | 0.000 | 0.100 | 0.040 | 0.013 |
+| GraphSAGE cosine | unlearnable (control) | 0.516 | 0.000 | 0.000 | 0.000 | 0.005 |
 | Adamic-Adar | unlearnable (control) | 0.518 | 0.000 | 0.000 | 0.000 | 0.004 |
 
-Base rate in the observable regime: 71,921 latent / 4.48M candidates ≈ 1.6%.
+Base rate in the observable regime: 71,921 latent / 4.21M unobserved
+candidates ≈ 1.7%.
 
-**Reading the results (v2, corrected protocol).**
+**Reading the results (v3, edge-disjoint protocol).**
 - **Observable regime:** the feature-aware pair ranker still wins on AUC
-  (0.644) and matches the GNN on P@10 (0.30 ≈ 19× base rate); under the
-  realistic negative protocol (negatives drawn from unobserved pairs, not an
-  oracle non-edge filter) its P@1 no longer lands (0.0 vs 1.0 in v1) — a
-  more conservative, less flattered estimate. 6/20 of its top-20 unconnected
-  pairs are true latent edges, and they are exactly the "likely useful"
-  profile: same sector + same region. The GNN embedding alone is on par with
-  raw feature cosine (0.586 vs 0.590); graph structure's contribution is
-  mostly mediated through the common-neighbor and degree features.
+  (0.644; multi-seed mean 0.604 ± 0.030 — the seed-42 run is the best of the
+  five seeds, so the canonical number is optimistic by ~1.1σ). Top-k
+  precision is a different story: under the edge-disjoint protocol the raw
+  feature cosine leads (P@10 0.50 ≈ 29× base rate, P@100 0.18, tied with the
+  GNN), and *no model* lands the single top pair (P@1 0.0 across the board).
+  4/20 of the pair ranker's top-20 unconnected pairs are true latent edges —
+  the "likely useful" profile (same sector + same region). The GNN embedding
+  alone is on par with raw feature cosine (0.577 vs 0.590); graph structure's
+  contribution is mostly mediated through the common-neighbor and degree
+  features. Top-k precision is seed-sensitive (P@10 spans 0.0–0.5 across the
+  five seeds) — read single-seed P@k as a point estimate, not a stable
+  ranking signal.
 - **Control (unlearnable) regime:** when the unobserved z dominates, the
-  same models + fixed pipeline collapse to AUC 0.52-0.59 with 0/20
-  top-precision — the relationship is genuinely unidentifiable from observed
-  data. Same code; only the data calibration differs. That gap *is* the
-  measurement of how much observable signal the task contains.
+  same models + fixed pipeline collapse to AUC 0.52–0.59 with 1/20
+  top-20 precision — the relationship is genuinely unidentifiable from
+  observed data. Same code; only the data calibration differs. That gap
+  *is* the measurement of how much observable signal the task contains.
 
-## Benchmark protocol (v2 — corrected evaluation)
+### Multi-seed validation (seeds 7, 123, 2024, 99, 42 — mean ± std)
 
-After a code review of the v1 code, four methodological issues were found
-and fixed; all numbers above are from the v2 pipeline (seed 42, re-run):
+| model | AUC (full / uniform) | MRR / Recall@10 | P@10 (std) | P@100 (std) |
+|---|---|---|---|---|
+| cora GraphSAGE | 0.8052 (0.0077) | MRR_u 0.3688 (0.0185) · R@10 0.2104 (0.0191) | — | — |
+| cora feature cosine | 0.8089 (0.0076) | R@10 0.1856 (0.0116) | — | — |
+| cora Adamic-Adar | 0.6963 (0.0046) | R@10 0.3189 (0.0087) | — | — |
+| b2b feature cosine | 0.5886 (0.0015) | — | 0.2600 (0.1855) | 0.1600 (0.0329) |
+| b2b Adamic-Adar | 0.6113 (0.0009) | — | 0.0400 (0.0490) | 0.1120 (0.0172) |
+| b2b GraphSAGE cosine | 0.5790 (0.0015) | — | 0.0600 (0.0490) | 0.1360 (0.0258) |
+| b2b pair ranker | 0.6038 (0.0299) | — | 0.1200 (0.1470) | 0.0720 (0.0431) |
+| recsys LightGCN | — | NDCG@10 0.1238 (0.0006) · R@10 0.1168 (0.0016) · MRR@10 0.2176 (0.0031) | — | — |
+| recsys PopRec | — | NDCG@10 0.0789 · R@10 0.0704 · MRR@10 0.1515 (std 0.0000) | — | — |
+
+The pipeline is **bit-deterministic** (`torch.use_deterministic_algorithms`
++ fixed seed: PyG's CUDA scatter is atomic-based and otherwise drifts ~1e-4
+run to run). Back-to-back seed-42 runs produce identical metrics, and the
+seed-42 column of this table matches `results.json` bit-for-bit on all 26
+cross-checked values.
+
+## Benchmark protocol (v3 — corrected evaluation, edge-disjoint, deterministic)
+
+v1→v2 fixed four methodological issues found in code review; v3 adds
+edge-disjoint ranker features (item 3), hardened samplers (item 5), and
+bit-level determinism (item 6). All numbers above are from the v3 pipeline
+(seed 42; multi-seed stats in the table above):
 
 1. **Negative-sample pairing.** v1 concatenated uniform + hard negative
    tensors along the batch dimension while repeating source nodes per
@@ -111,30 +138,48 @@ and fixed; all numbers above are from the v2 pipeline (seed 42, re-run):
 2. **Adamic-Adar formula.** v1 weighted the *endpoints*
    (`diag(w) @ A @ Aᵀ @ diag(w)`); true Adamic-Adar weights the *common
    neighbors*: `aa[u,v] = Σ_c 1/log(deg(c)) = A @ diag(w) @ Aᵀ`.
-3. **Ranker train/test separation.** v1 selected ranker negatives from the
-   oracle non-edge mask (which knew the latent edges) and used degrees that
-   included the target edge. v2 samples ranker negatives from **unobserved
-   pairs using training-time information only** (~1.6% of them are in fact
-   latent test positives — a realistic, slightly *conservative* negative
-   distribution), and corrects positive-pair degrees with the edge-removal
-   convention (the direct edge contributes 1 to each endpoint's degree;
-   common-neighbors is provably unaffected).
+3. **Ranker train/test separation (edge-disjoint out-of-fold).** v1
+   selected ranker negatives from the oracle non-edge mask (which knew the
+   latent edges) and used degrees that included the target edge. v2 goes
+   further: the observed train edges are split 80/20 into an MP graph and a
+   SUP set. SAGE trains on the MP graph **only** (graph, loss, and negative
+   exclusion all restricted to it), and the ranker's positive labels are the
+   SUP edges — so every ranker feature for a positive pair (SAGE cosine,
+   degrees, common neighbors) was computed without that edge present, at the
+   edge level. Ranker negatives are sampled from unobserved pairs using
+   training-time information only (~1.6% of them are in fact latent test
+   positives — a realistic, slightly *conservative* negative distribution).
+   Note: sampled unobserved negatives CAN contain withheld true edges, so
+   "no false negatives" applies to the *observed* graph exclusions, not to
+   the ground truth as a whole.
 4. **Cora evaluation cleanup.** The message-passing graph is now
    bidirectional (one orientation per undirected train edge in v1); offline
    top-pair generation explicitly masks known edges (train + held-out +
    self), not just duplicate-feature pairs; and the full-ranking Recall@k
    candidate set now includes other held-out edges (they compete, as they
    do in the real task).
-
-Additionally, all uniform negative sampling (training and evaluation, both
-graphs) now rejects train-neighbors, self, and the positive's destination —
-no false negatives.
+5. **Negative samplers hardened.** All negative sampling (training and
+   evaluation, both graphs) rejects observed neighbors, self, and the
+   positive's destination. The samplers never use an unrestricted uniform
+   fallback: when stochastic rounds fail, an explicit enumeration pass scans
+   a random permutation of all nodes and keeps only valid candidates, and
+   raises `RuntimeError` if a row has fewer than K valid nodes in total.
+   Invariant tests cover sparse, dense (top-up-forcing), empty-class-pool,
+   and raise-on-impossible cases (24 tests, all passing).
+6. **Bit-level determinism.** PyG scatter on CUDA is atomic-based, so the
+   pipeline otherwise drifts ~1e-4 run to run (top-k boundary ranks flip).
+   Every training script now runs under
+   `torch.use_deterministic_algorithms(True)`: back-to-back seed-42 runs
+   produce bit-identical metrics (verified), and the suite's artifacts are
+   exactly reproducible.
 
 Known remaining limitations (documented, not fixed):
-- GNN link-prediction embeddings are trained on the train graph, so pair
-  scores for held-out edges see structure that includes the train edges of
-  the endpoints (standard for GNN link prediction; per-edge removal is
-  infeasible at this scale).
+- The `sage_cosine` model itself is a GNN link-prediction baseline: its
+  embeddings are trained on the MP graph, so its scores for held-out edges
+  reflect the GNN's view of that graph (standard for GNN link prediction).
+  The edge-disjoint protocol removes this exposure specifically for the
+  *ranker's* features, which is where train/test feature consistency
+  matters most.
 - Sampled MRR treats a tie in favor of the positive (common convention).
 - B2B sampled negatives can contain latent edges of the same source
   (realistic deployment condition, conservative direction).
@@ -165,6 +210,9 @@ scripts/
   train_b2b.py             4 models: feature_cosine, adamic_adaar, sage_cosine,
                            pair_ranker (relationship-feature MLP)
   run_experiments.py       one-command suite -> experiments/results.{json,md}
+  multi_seed.py            5-seed statistical validation (mean/std) ->
+                           experiments/multi_seed.{json,md}; seed-42 last so
+                           served artifacts stay canonical
   eval_common.py           exact rank-based metrics (AUC, MRR, Recall@k, Precision@k)
 serve/app.py               FastAPI app (dashboard + all endpoints above)
 tests/                     pytest: eval-math unit tests + API contract tests
@@ -177,8 +225,12 @@ deploy/                    systemd units for app + tunnel
 ## Reproduce
 
 ```bash
-# full suite (~15 min on GPU; deterministic, seed 42)
+# full suite (~3 min on RTX 4060 Ti; bit-deterministic, seed 42)
 .venv/bin/python scripts/run_experiments.py
+
+# multi-seed statistical validation (~15 min; seeds 7,123,2024,99,42;
+# delete experiments/multi_seed.json first for a fully fresh run)
+.venv/bin/python scripts/multi_seed.py
 
 # or piece by piece
 .venv/bin/python scripts/train_linkpred.py        # Cora GraphSAGE

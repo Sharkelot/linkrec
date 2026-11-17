@@ -15,6 +15,7 @@ Identical protocol to train_linkpred.py:
 Output: outputs/cora_baselines.json
 """
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -22,14 +23,14 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from train_linkpred import (EVAL_NEGS, RECALL_KS, build_edge_splits, to_index,
-                            sample_negatives)
-from eval_common import full_rank_recall, sample_neg_excluding, sampled_mrr_auc
+from train_linkpred import (EVAL_NEGS, RECALL_KS, build_edge_splits, to_index)
+from eval_common import (full_rank_recall, sample_class_negatives,
+                         sample_neg_excluding, sampled_mrr_auc)
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
 DATA = ROOT / "data"
-SEED = 42
+SEED = int(os.environ.get("LINKREC_SEED", "42"))
 HOLDOUT_FRAC = 0.2
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -60,7 +61,8 @@ def main():
     # uniform eval negatives exclude train neighbors / src / dst (same as
     # the model pipeline); hard negatives are same-class non-neighbors
     neg_u = sample_neg_excluding(held[0], held[1], adj, EVAL_NEGS, gen, N)
-    neg_h = sample_negatives(held[0], held[1], y, pools, adj, EVAL_NEGS, DEVICE, gen)
+    neg_h = sample_class_negatives(held[0], held[1], y[held[1]], pools,
+                                   adj, EVAL_NEGS, gen, N)
     neg_src = held[0].repeat_interleave(2 * EVAL_NEGS)
     neg_dst = torch.cat([neg_u, neg_h], dim=1).view(-1)  # per-edge grouping
 

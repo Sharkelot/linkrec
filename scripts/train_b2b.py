@@ -23,6 +23,7 @@ Outputs:
   outputs/b2b_metrics.json, b2b_model.pt, b2b_ranker.pt, b2b_top_pairs.json
 """
 import json
+import os
 import time
 from pathlib import Path
 
@@ -31,11 +32,12 @@ import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
 
 from eval_common import (auc_rank, full_rank_recall, precision_at_k,
-                         sampled_mrr_auc, sample_neg_excluding)
+                         sampled_mrr_auc, sample_class_negatives,
+                         sample_neg_excluding)
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
-SEED = 42
+SEED = int(os.environ.get("LINKREC_SEED", "42"))
 HIDDEN = 128
 EPOCHS = 120
 LR = 1e-3
@@ -73,6 +75,9 @@ class PairRanker(torch.nn.Module):
 
 
 def main():
+    # bit-level reproducibility: PyG scatter on CUDA is atomic-based and
+    # otherwise drifts ~1e-4 run to run; deterministic mode pins the kernels
+    torch.use_deterministic_algorithms(True)
     torch.manual_seed(SEED)
     rng = torch.Generator(device=DEVICE).manual_seed(SEED)
     t0 = time.time()
@@ -89,6 +94,25 @@ def main():
     n_latent = latent_pairs.size(1)
     print(f"[b2b] N={N} train={n_train} latent={n_latent} (device={DEVICE})")
 
+    # ---- edge-disjoint protocol (out-of-fold ranker features) ----
+    # Split the observed train edges into:
+    #   MP  (80%): the message-passing graph - SAGE trains here (graph,
+    #              loss and negative exclusion all on MP only).
+    #   SUP (20%): held out from the GNN entirely; used as the ranker's
+    #              positive labels, so the ranker's SAGE-embedding / degree
+    #              / common-neighbor features for a positive pair were
+    #              computed WITHOUT that edge present (edge-level
+    #              out-of-fold; no degree correction needed).
+    perm_e = torch.randperm(n_train, device=DEVICE, generator=rng)
+    n_mp = int(n_train * 0.8)
+    mp_pairs = train_pairs[:, perm_e[:n_mp]]
+    sup_pairs = train_pairs[:, perm_e[n_mp:]]
+    mp_adj = torch.zeros(N, N, dtype=torch.bool, device=DEVICE)
+    mp_adj[mp_pairs[0], mp_pairs[1]] = True
+    mp_adj = mp_adj | mp_adj.T
+    edge_index_mp = torch.cat([mp_pairs, mp_pairs.flip(0)], dim=1)  # both directions
+    print(f"[b2b] edge-disjoint: MP={mp_pairs.size(1)} SUP={sup_pairs.size(1)}")
+
     sector_pools = [torch.nonzero(sector == c).squeeze(1) for c in range(meta["n_sectors"])]
     tri_i, tri_j = torch.triu_indices(N, N, offset=1, device=DEVICE)
 
@@ -97,53 +121,31 @@ def main():
 
     # ---------------------------------------------------------------- SAGE
     # memory-lean: one forward per epoch, per-block backward with
-    # gradient accumulation (GPU is shared). Hard negatives are sampled
-    # fully vectorized (flat class pool + gather) - a per-edge Python loop
-    # does not scale to dense graphs.
+    # gradient accumulation (GPU is shared). Negatives sampled via the
+    # hardened vectorized samplers in eval_common (exclusions + explicit
+    # valid top-up, never an unrestricted fallback).
     model = SAGE(x.shape[1], HIDDEN, HIDDEN).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     margin = 1.0
     BLOCK = 8192
 
-    sizes = torch.tensor([p.numel() for p in sector_pools], device=DEVICE)
-    cls_start = torch.zeros(len(sector_pools) + 1, dtype=torch.long, device=DEVICE)
-    cls_start[1:] = torch.cumsum(sizes, 0)
-    pool_nodes = torch.cat(sector_pools).to(DEVICE)
-
-    def sample_hard(sb, eb, K, gen):
-        """K hard negatives per (src, dst): same class as dst, not a train
-        neighbor of src, not src/dst itself; uniform fallback where the
-        pool is exhausted. sb/eb: (m,) long -> (m, K) long."""
-        c = sector[eb]
-        m = sb.numel()
-        # uniform per-row index into the dst's class pool (randint in torch
-        # 2.14 rejects tensor high, so use rand*size floor sampling)
-        off = (torch.rand(m, 2 * K, device=DEVICE, generator=gen)
-               * sizes[c].unsqueeze(1)).long()
-        cand = pool_nodes[cls_start[c].unsqueeze(1) + off]
-        valid = ~train_adj[sb.unsqueeze(1).expand(m, 2 * K), cand]
-        valid &= (cand != eb.unsqueeze(1)) & (cand != sb.unsqueeze(1))
-        sel = torch.argsort(~valid, dim=1)[:, :K]  # valid (False) sort first
-        out = cand.gather(1, sel)
-        bad = ~valid.gather(1, sel)
-        if bad.any():
-            out[bad] = torch.randint(0, N, (int(bad.sum().item()),),
-                                     device=DEVICE, generator=gen)
-        return out
-
+    n_mp = mp_pairs.size(1)
     for epoch in range(1, EPOCHS + 1):
         model.train()
         opt.zero_grad()
-        emb = F.normalize(model(x, G["edge_index_train"]), dim=-1)
-        # uniform negatives exclude train neighbors / self / dst (no false
-        # negatives); cat along dim=1 so each edge keeps ITS OWN negatives
-        neg_u = sample_neg_excluding(train_pairs[0], train_pairs[1], train_adj,
+        emb = F.normalize(model(x, edge_index_mp), dim=-1)
+        # negatives exclude ALL observed (train) neighbors / self / dst
+        # (stricter than the MP graph - no false negatives); cat along
+        # dim=1 so each edge keeps ITS OWN negatives
+        neg_u = sample_neg_excluding(mp_pairs[0], mp_pairs[1], train_adj,
                                      NEG_K, rng, N)
-        neg_h = sample_hard(train_pairs[0], train_pairs[1], NEG_K, rng)
+        neg_h = sample_class_negatives(mp_pairs[0], mp_pairs[1],
+                                       sector[mp_pairs[1]], sector_pools,
+                                       train_adj, NEG_K, rng, N)
         total_loss, nb = 0.0, 0
-        for b in range(0, n_train, BLOCK):
-            e = min(b + BLOCK, n_train)
-            sb, eb = train_pairs[0, b:e], train_pairs[1, b:e]
+        for b in range(0, n_mp, BLOCK):
+            e = min(b + BLOCK, n_mp)
+            sb, eb = mp_pairs[0, b:e], mp_pairs[1, b:e]
             m = sb.numel()
             pos = F.cosine_similarity(emb[sb], emb[eb], dim=-1)
             neg_dst = torch.cat([neg_u[b:e], neg_h[b:e]], dim=1).view(-1)
@@ -160,7 +162,7 @@ def main():
 
     # ---------------------------------------------------------------- scores
     with torch.no_grad():
-        emb = F.normalize(model(x, G["edge_index_train"]), dim=-1)
+        emb = F.normalize(model(x, edge_index_mp), dim=-1)
         sim_sage = emb @ emb.T
         sim_feat = x @ x.T  # features are already ~unit; cosine below
         sim_feat = F.normalize(x, dim=-1) @ F.normalize(x, dim=-1).T
@@ -182,7 +184,8 @@ def main():
     lat_pos = latent_pairs
     neg_u = sample_neg_excluding(lat_pos[0], lat_pos[1], train_adj,
                                  EVAL_NEGS, rng, N)
-    neg_h = sample_hard(lat_pos[0], lat_pos[1], EVAL_NEGS, rng)
+    neg_h = sample_class_negatives(lat_pos[0], lat_pos[1], sector[lat_pos[1]],
+                                   sector_pools, train_adj, EVAL_NEGS, rng, N)
     neg_src = lat_pos[0].repeat_interleave(2 * EVAL_NEGS)
 
     def evaluate(name, sim):
@@ -221,39 +224,42 @@ def main():
     }
 
     # ---------------------------------------------------------------- ranker
+    # Features come from the MP graph only (edge-disjoint protocol): the
+    # SUP edges are the positive labels and were NEVER present in the SAGE
+    # graph, so sim_sage / degrees / common-neighbors for a positive pair
+    # are genuine out-of-fold predictions (no degree correction needed).
     with torch.no_grad():
-        cn = (train_adj.float() @ train_adj.float())  # common neighbors
+        cn = (mp_adj.float() @ mp_adj.float())  # common neighbors (MP graph)
         cn.fill_diagonal_(0)
-        deg = train_adj.sum(dim=1)
+        deg = mp_adj.sum(dim=1)
 
-        def pair_feats(a, b, deg_adj=0):
-            """Relationship-specific features for index pairs (a, b).
-            deg_adj: subtract from both degrees - for POSITIVES the target
-            edge itself contributes 1 to each endpoint's degree (edge-
-            removal protocol); common_neighbors is unaffected by the direct
-            edge (A[u,u]=A[v,v]=0)."""
+        def pair_feats(a, b):
+            """Relationship-specific features for index pairs (a, b),
+            computed on the MP graph only (see above)."""
             return torch.stack([
                 sim_sage[a, b],
                 (sector[a] == sector[b]).float(),
                 (region[a] == region[b]).float(),
                 (size[a] - size[b]).abs(),
-                torch.log1p((deg[a] - deg_adj).float()),
-                torch.log1p((deg[b] - deg_adj).float()),
+                torch.log1p(deg[a].float()),
+                torch.log1p(deg[b].float()),
                 torch.log1p(cn[a, b].float()),
             ], dim=-1)
 
-        # train samples: positives = train edges (degree-corrected).
+        # train samples: positives = SUP edges (held out from the GNN).
         # negatives = UNOBSERVED pairs sampled from training-time information
         # only (~1.6% of them are in fact latent test positives - a
         # realistic, slightly conservative negative distribution; NOT an
-        # oracle non-edge filter).
+        # oracle non-edge filter). SUP edges can't appear here: they are
+        # part of train_adj.
         unobs_idx = (~train_adj)[tri_i, tri_j].nonzero().squeeze(1)
-        n_neg = min(n_train * 2, unobs_idx.numel())
+        n_neg = min(sup_pairs.size(1) * 2, unobs_idx.numel())
         sel = torch.randperm(unobs_idx.numel(), device=DEVICE, generator=rng)[:n_neg]
         neg_pairs = torch.stack([tri_i[unobs_idx[sel]], tri_j[unobs_idx[sel]]])
-        X = torch.cat([pair_feats(train_pairs[0], train_pairs[1], deg_adj=1),
+        X = torch.cat([pair_feats(sup_pairs[0], sup_pairs[1]),
                        pair_feats(neg_pairs[0], neg_pairs[1])])
-        y = torch.cat([torch.ones(n_train, device=DEVICE), torch.zeros(n_neg, device=DEVICE)])
+        y = torch.cat([torch.ones(sup_pairs.size(1), device=DEVICE),
+                       torch.zeros(n_neg, device=DEVICE)])
 
     ranker = PairRanker(n_feat=7).to(DEVICE)
     ropt = torch.optim.Adam(ranker.parameters(), lr=5e-3)
@@ -283,7 +289,9 @@ def main():
         sim = score_ranker
         masked = sim.masked_fill(~cand_mask, float("-inf"))
         cand_flat = masked[tri_i, tri_j]
-        vals, idx = torch.topk(cand_flat, TOP_K)
+        # deterministic tie-break (torch.topk has no stable option)
+        tie = torch.arange(cand_flat.numel(), device=DEVICE, dtype=cand_flat.dtype) * 1e-9
+        vals, idx = torch.topk(cand_flat + tie, TOP_K)
     top = []
     for j in range(TOP_K):
         a, b = int(tri_i[idx[j]]), int(tri_j[idx[j]])
@@ -304,6 +312,9 @@ def main():
     torch.save({"state_dict": ranker.state_dict()}, OUT / "b2b_ranker.pt")
     (OUT / "b2b_metrics.json").write_text(json.dumps(
         {"n_companies": N, "n_train_edges": n_train, "n_latent_edges": n_latent,
+         "protocol": "edge-disjoint: SAGE trains on MP edges only; ranker "
+                    "positives = SUP edges (features computed without them)",
+         "n_mp_edges": int(mp_pairs.size(1)), "n_sup_edges": int(sup_pairs.size(1)),
          "models": results, "train_seconds": round(time.time() - t0, 2), "seed": SEED},
         indent=2))
     (OUT / "b2b_top_pairs.json").write_text(json.dumps(top, indent=2))
