@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 from train_linkpred import (EVAL_NEGS, RECALL_KS, build_edge_splits, to_index,
                             sample_negatives)
-from eval_common import full_rank_recall, sampled_mrr_auc
+from eval_common import full_rank_recall, sample_neg_excluding, sampled_mrr_auc
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
@@ -57,30 +57,32 @@ def main():
     pools = [torch.nonzero(y == c).squeeze(1).contiguous() for c in range(int(y.max()) + 1)]
 
     held = holdout_idx
-    neg_u = torch.randint(0, N, (held.size(1), EVAL_NEGS), device=DEVICE, generator=gen)
+    # uniform eval negatives exclude train neighbors / src / dst (same as
+    # the model pipeline); hard negatives are same-class non-neighbors
+    neg_u = sample_neg_excluding(held[0], held[1], adj, EVAL_NEGS, gen, N)
     neg_h = sample_negatives(held[0], held[1], y, pools, adj, EVAL_NEGS, DEVICE, gen)
     neg_src = held[0].repeat_interleave(2 * EVAL_NEGS)
+    neg_dst = torch.cat([neg_u, neg_h], dim=1).view(-1)  # per-edge grouping
 
-    # candidate mask for full ranking: not connected in train, not held-out, not self
-    held_adj = torch.zeros(N, N, dtype=torch.bool, device=DEVICE)
-    held_adj[held[0], held[1]] = True
-    held_adj[held[1], held[0]] = True
-    cand_mask = ~(adj | held_adj | torch.eye(N, dtype=torch.bool, device=DEVICE))
+    # candidate mask for full ranking: all non-train-neighbors (other
+    # held-out edges compete; the positive cancels under the tie-break)
+    cand_mask = ~(adj | torch.eye(N, dtype=torch.bool, device=DEVICE))
 
     sim_feat = x @ x.T
+    # Adamic-Adar: SUM OVER COMMON NEIGHBORS w of 1/log(deg w)
     deg = adj.float().sum(dim=1)
     w = torch.where(deg > 1, 1.0 / torch.log(deg.clamp(min=2)), torch.zeros_like(deg))
     A = adj.float()
-    aa = torch.diag_embed(w) @ A @ A.t() @ torch.diag_embed(w)
+    aa = A @ torch.diag_embed(w) @ A.t()
     aa = aa * (aa > 0).float()
     sim_aa = aa / aa.max().clamp(min=1.0)
 
     results = {}
     for name, sim in (("feature_cosine", sim_feat), ("adamic_adaar", sim_aa)):
         pos = sim[held[0], held[1]]
-        neg = sim[neg_src, torch.cat([neg_u, neg_h]).view(-1)]
-        mrr_u, auc_u = sampled_mrr_auc(pos, neg[:held.size(1) * EVAL_NEGS].view(-1, EVAL_NEGS))
-        mrr_h, auc_h = sampled_mrr_auc(pos, neg[held.size(1) * EVAL_NEGS:].view(-1, EVAL_NEGS))
+        neg = sim[neg_src, neg_dst].view(-1, 2, EVAL_NEGS)
+        mrr_u, auc_u = sampled_mrr_auc(pos, neg[:, 0])
+        mrr_h, auc_h = sampled_mrr_auc(pos, neg[:, 1])
         recall = full_rank_recall(sim, cand_mask, held, RECALL_KS)
         results[name] = {
             "auc_uniform": round(auc_u, 4), "mrr_uniform": round(mrr_u, 4),

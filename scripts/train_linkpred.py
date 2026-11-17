@@ -36,7 +36,7 @@ import torch.nn.functional as F
 from torch_geometric.datasets import Planetoid
 from torch_geometric.nn import SAGEConv
 
-from eval_common import full_rank_recall
+from eval_common import (full_rank_recall, sample_neg_excluding)
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
@@ -146,7 +146,8 @@ def main():
     print(f"[splits] train edges: {train_idx.size(1)}, held-out linkpred edges: {holdout_idx.size(1)}")
 
     data.x = F.normalize(data.x, dim=-1)
-    data.edge_index = train_idx
+    # bidirectional message passing: each undirected train edge both ways
+    data.edge_index = torch.cat([train_idx, train_idx.flip(0)], dim=1)
 
     # per-class node pools (for hard negatives)
     pools = [torch.nonzero(y == c).squeeze(1).contiguous() for c in range(int(y.max()) + 1)]
@@ -166,12 +167,15 @@ def main():
         emb = F.normalize(emb, dim=-1)
         pos = score_pairs(emb, train_idx[0], train_idx[1])
 
-        neg_uniform = torch.randint(0, N, (train_idx.size(1), NEG_K),
-                                    device=DEVICE, generator=gen)
+        # negatives: uniform (excluding train neighbors/src/dst) + hard
+        # (same class); cat along dim=1 so each edge keeps ITS OWN negatives
+        neg_uniform = sample_neg_excluding(train_idx[0], train_idx[1], adj,
+                                           NEG_K, gen, N)
         neg_hard = sample_negatives(train_idx[0], train_idx[1], y, pools,
                                     adj, NEG_K, DEVICE, gen)
         neg_src = train_idx[0].repeat_interleave(2 * NEG_K)
-        neg = score_pairs(emb, neg_src, torch.cat([neg_uniform, neg_hard]).view(-1))
+        neg_dst = torch.cat([neg_uniform, neg_hard], dim=1).view(-1)
+        neg = score_pairs(emb, neg_src, neg_dst)
         neg = neg.view(train_idx.size(1), 2, NEG_K).mean(dim=(1, 2))
         loss = F.relu(margin - pos + neg).mean()
         loss.backward()
@@ -188,8 +192,8 @@ def main():
         held = holdout_idx
         pos_scores = score_pairs(emb, held[0], held[1]).cpu()
 
-        neg_uniform = torch.randint(0, N, (held.size(1), EVAL_NEGS),
-                                    device=DEVICE, generator=gen)
+        # eval negatives: uniform with the same exclusions as training
+        neg_uniform = sample_neg_excluding(held[0], held[1], adj, EVAL_NEGS, gen, N)
         mrr_uniform, auc_uniform = sampled_mrr_auc(
             pos_scores, score_pairs(emb, held[0].repeat_interleave(EVAL_NEGS),
                                     neg_uniform.view(-1)).cpu().view(-1, EVAL_NEGS))
@@ -200,21 +204,27 @@ def main():
             pos_scores, score_pairs(emb, held[0].repeat_interleave(EVAL_NEGS),
                                     neg_hard.view(-1)).cpu().view(-1, EVAL_NEGS))
 
-        # full-ranking Recall@k: rank true dst among ALL nodes unconnected to src
+        # full-ranking Recall@k: rank true dst among all non-train-neighbors
+        # of src. Other held-out edges DO compete (they are unconnected to
+        # src in the train graph); the positive itself cancels under the
+        # tie-break (score_v + tb_v is never > itself).
         sim = emb @ emb.T
+        cand = ~(adj | torch.eye(N, device=DEVICE, dtype=torch.bool))
+        recall_at = full_rank_recall(sim, cand, held, RECALL_KS)
+
+        # top unconnected pairs: mask KNOWN edges (train + held + self) and
+        # identical-feature (duplicate) pairs
         held_adj = torch.zeros(N, N, dtype=torch.bool, device=DEVICE)
         held_adj[held[0], held[1]] = True
         held_adj[held[1], held[0]] = True
-        cand = ~(adj | held_adj | torch.eye(N, device=DEVICE, dtype=torch.bool))
-        recall_at = full_rank_recall(sim, cand, held, RECALL_KS)
-
-        # top unconnected pairs, excluding identical-feature (duplicate) pairs
+        known = adj | held_adj | torch.eye(N, device=DEVICE, dtype=torch.bool)
         _, inv = torch.unique(data.x, dim=0, return_inverse=True)
         dup = inv.unsqueeze(0) == inv.unsqueeze(1)
         tri = torch.triu_indices(N, N, offset=1, device=DEVICE)
         cand_flat = sim[tri[0], tri[1]]
-        cand_flat = cand_flat.masked_fill(dup[tri[0], tri[1]], float("-inf"))
-        n_dup_excluded = int(cand_flat.isinf().sum().item())
+        cand_flat = cand_flat.masked_fill(
+            known[tri[0], tri[1]] | dup[tri[0], tri[1]], float("-inf"))
+        n_dup_excluded = int((dup[tri[0], tri[1]] & ~known[tri[0], tri[1]]).sum().item())
         topk = min(TOP_K, int((~cand_flat.isinf()).sum().item()))
         vals, idx = torch.topk(cand_flat, topk)
         top_pairs = [(int(tri[0][idx[j]]), int(tri[1][idx[j]]), float(vals[j]))
@@ -231,7 +241,7 @@ def main():
                 "args": {"in_dim": data.x.shape[1], "hidden": HIDDEN, "out": HIDDEN}},
                OUT / "linkpred_model.pt")
     torch.save({"x": data.x.cpu(),
-                "edge_index_train": train_idx.cpu(),
+                "edge_index_train": data.edge_index.cpu(),  # bidirectional (as trained)
                 "edge_index_heldout": holdout_idx.cpu(),
                 "num_nodes": N,
                 "names": names}, OUT / "linkpred_data.pt")
@@ -255,10 +265,11 @@ def main():
         # top-pair ranking hygiene
         "duplicate_feature_pairs_excluded": n_dup_excluded,
         "negative_sampling": {
-            "training": f"{NEG_K} uniform + {NEG_K} same-class (hard) per edge",
-            "eval_uniform": f"{EVAL_NEGS} random nodes per held-out edge",
+            "training": f"{NEG_K} uniform (excluding train neighbors/src/dst) + {NEG_K} same-class (hard) per edge",
+            "eval_uniform": f"{EVAL_NEGS} random non-neighbor nodes per held-out edge (same exclusions)",
             "eval_hard": f"{EVAL_NEGS} same-class non-neighbor nodes per held-out edge",
-            "full_ranking": "Recall@k ranks the true edge among all unconnected candidates",
+            "full_ranking": "Recall@k ranks the true edge among all non-train-neighbors (other held-out edges compete)",
+            "message_passing": "bidirectional (both orientations of each undirected train edge)",
         },
         "train_seconds": round(time.time() - t0, 2),
         "final_loss": round(hist[-1], 4),

@@ -58,3 +58,32 @@ def precision_at_k(sim, cand_mask, latent_mask, ks):
     order = torch.argsort(scores, descending=True)
     lat = latent_mask[tri[0], tri[1]]
     return {f"precision@{k}": float(lat[order[:k]].float().mean().item()) for k in ks}
+
+
+def sample_neg_excluding(src, dst, adj, K, gen, N, rounds=2):
+    """K uniform negatives per (src, dst) that are NOT src's adj-neighbors,
+    not src itself, and not the positive dst. Vectorized; `rounds` of
+    2K-candidate draws cover sparse-to-moderate neighbor fractions
+    (Cora ~2%, B2B ~20%); a final uniform top-up covers pathological rows.
+    src/dst: (m,) long; adj: N×N bool -> (m, K) long."""
+    m = src.numel()
+    dev = src.device
+    out = None
+    still_bad = None
+    for r in range(rounds):
+        cand = torch.randint(0, N, (m, 2 * K), device=dev, generator=gen)
+        ok = ~adj[src.unsqueeze(1).expand(m, 2 * K), cand]
+        ok &= (cand != dst.unsqueeze(1)) & (cand != src.unsqueeze(1))
+        sel = torch.argsort(~ok, dim=1)[:, :K]  # ok (False) sorts first
+        chosen = cand.gather(1, sel)
+        good = ok.gather(1, sel)
+        if r == 0:
+            out = chosen
+            still_bad = ~good
+        else:
+            out[still_bad] = chosen[still_bad]
+            still_bad = still_bad & ~good
+    if still_bad.any():
+        out[still_bad] = torch.randint(0, N, (int(still_bad.sum().item()),),
+                                      device=dev, generator=gen)
+    return out

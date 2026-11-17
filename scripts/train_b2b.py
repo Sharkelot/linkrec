@@ -3,7 +3,9 @@
 
 Models compared (identical protocol, identical splits):
   1. feature_cosine  - cosine of OBSERVED node features (no graph)
-  2. adamic_adaar    - common-neighbor count baseline on the train graph
+  2. adamic_adaar    - Adamic-Adar: sum over common neighbors c of
+                       1/log(deg(c)) (weights the COMMON neighbors, not
+                       the endpoints), on the train graph
   3. sage_cosine     - GraphSAGE embeddings, cosine score
   4. pair_ranker     - MLP over relationship-specific pair features:
                        [sage_cosine, sector_match, region_match, size_diff,
@@ -29,7 +31,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
 
 from eval_common import (auc_rank, full_rank_recall, precision_at_k,
-                         sampled_mrr_auc)
+                         sampled_mrr_auc, sample_neg_excluding)
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "outputs"
@@ -81,7 +83,6 @@ def main():
     sector, region, size = G["sector"], G["region"], G["size"]
     train_adj = G["train_adj"]
     latent = G["latent_mask"]
-    nonedge = G["nonedge_mask"]
     train_pairs = G["train_pairs"]
     latent_pairs = G["latent_pairs"]
     n_train = train_pairs.size(1)
@@ -134,7 +135,10 @@ def main():
         model.train()
         opt.zero_grad()
         emb = F.normalize(model(x, G["edge_index_train"]), dim=-1)
-        neg_u = torch.randint(0, N, (n_train, NEG_K), device=DEVICE, generator=rng)
+        # uniform negatives exclude train neighbors / self / dst (no false
+        # negatives); cat along dim=1 so each edge keeps ITS OWN negatives
+        neg_u = sample_neg_excluding(train_pairs[0], train_pairs[1], train_adj,
+                                     NEG_K, rng, N)
         neg_h = sample_hard(train_pairs[0], train_pairs[1], NEG_K, rng)
         total_loss, nb = 0.0, 0
         for b in range(0, n_train, BLOCK):
@@ -142,7 +146,7 @@ def main():
             sb, eb = train_pairs[0, b:e], train_pairs[1, b:e]
             m = sb.numel()
             pos = F.cosine_similarity(emb[sb], emb[eb], dim=-1)
-            neg_dst = torch.cat([neg_u[b:e], neg_h[b:e]]).view(-1)
+            neg_dst = torch.cat([neg_u[b:e], neg_h[b:e]], dim=1).view(-1)
             neg = F.cosine_similarity(emb[sb.repeat_interleave(2 * NEG_K)],
                                       emb[neg_dst], dim=-1)
             neg = neg.view(m, 2, NEG_K).mean(dim=(1, 2))
@@ -161,27 +165,34 @@ def main():
         sim_feat = x @ x.T  # features are already ~unit; cosine below
         sim_feat = F.normalize(x, dim=-1) @ F.normalize(x, dim=-1).T
 
-        # Adamic-Adar on the train graph
+        # Adamic-Adar on the train graph: weight the COMMON neighbors
+        # aa[u,v] = sum_{c in N(u) cap N(v)} 1/log(deg(c))
         deg = train_adj.float().sum(dim=1)
         w = torch.where(deg > 1, 1.0 / torch.log(deg.clamp(min=2)), torch.zeros_like(deg))
         A = train_adj.float()
-        aa = torch.diag_embed(w) @ A @ A.t() @ torch.diag_embed(w)
+        aa = A @ torch.diag_embed(w) @ A.t()
         aa = aa.masked_fill(torch.eye(N, dtype=torch.bool, device=DEVICE), 0.0)
-        aa = aa * (aa > 0).float()  # keep only connected pairs
         aa_max = aa.max().clamp(min=1.0)
         sim_aa = aa / aa_max
 
-    # shared sampled negatives for MRR/AUC (LATENT pairs are the positives)
+    # shared sampled negatives for MRR/AUC (LATENT pairs are the positives).
+    # Negatives exclude train neighbors / self / dst. NOTE: sampled from
+    # unobserved-space nodes, so a latent edge of the same src CAN appear
+    # among the negatives (realistic deployment condition, conservative).
     lat_pos = latent_pairs
-    neg_u = torch.randint(0, N, (n_latent, EVAL_NEGS), device=DEVICE, generator=rng)
+    neg_u = sample_neg_excluding(lat_pos[0], lat_pos[1], train_adj,
+                                 EVAL_NEGS, rng, N)
     neg_h = sample_hard(lat_pos[0], lat_pos[1], EVAL_NEGS, rng)
     neg_src = lat_pos[0].repeat_interleave(2 * EVAL_NEGS)
 
     def evaluate(name, sim):
         pos = sim[lat_pos[0], lat_pos[1]]
-        neg_s = sim[neg_src, torch.cat([neg_u, neg_h]).view(-1)]
-        mrr_u, auc_u = sampled_mrr_auc(pos, neg_s[:n_latent * EVAL_NEGS].view(n_latent, EVAL_NEGS))
-        mrr_h, auc_h = sampled_mrr_auc(pos, neg_s[n_latent * EVAL_NEGS:].view(n_latent, EVAL_NEGS))
+        # dim=1 cat keeps each src's own negatives grouped; reshape to
+        # (n, 2, K): column 0 = uniform, column 1 = hard
+        neg_s = sim[neg_src, torch.cat([neg_u, neg_h], dim=1).view(-1)].view(
+            n_latent, 2, EVAL_NEGS)
+        mrr_u, auc_u = sampled_mrr_auc(pos, neg_s[:, 0])
+        mrr_h, auc_h = sampled_mrr_auc(pos, neg_s[:, 1])
         # exact AUC over the whole candidate space
         tri_scores = sim[tri_i, tri_j]
         tri_lat = latent[tri_i, tri_j]
@@ -215,24 +226,32 @@ def main():
         cn.fill_diagonal_(0)
         deg = train_adj.sum(dim=1)
 
-        def pair_feats(a, b):
-            """Relationship-specific features for index pairs (a, b)."""
+        def pair_feats(a, b, deg_adj=0):
+            """Relationship-specific features for index pairs (a, b).
+            deg_adj: subtract from both degrees - for POSITIVES the target
+            edge itself contributes 1 to each endpoint's degree (edge-
+            removal protocol); common_neighbors is unaffected by the direct
+            edge (A[u,u]=A[v,v]=0)."""
             return torch.stack([
                 sim_sage[a, b],
                 (sector[a] == sector[b]).float(),
                 (region[a] == region[b]).float(),
                 (size[a] - size[b]).abs(),
-                torch.log1p(deg[a].float()),
-                torch.log1p(deg[b].float()),
+                torch.log1p((deg[a] - deg_adj).float()),
+                torch.log1p((deg[b] - deg_adj).float()),
                 torch.log1p(cn[a, b].float()),
             ], dim=-1)
 
-        # train samples: positives = train edges, negatives = true non-edges
-        neg_pairs_idx = nonedge[tri_i, tri_j].nonzero().squeeze(1)
-        n_neg = min(n_train * 2, neg_pairs_idx.numel())
-        sel = torch.randperm(neg_pairs_idx.numel(), device=DEVICE, generator=rng)[:n_neg]
-        neg_pairs = torch.stack([tri_i[neg_pairs_idx[sel]], tri_j[neg_pairs_idx[sel]]])
-        X = torch.cat([pair_feats(train_pairs[0], train_pairs[1]),
+        # train samples: positives = train edges (degree-corrected).
+        # negatives = UNOBSERVED pairs sampled from training-time information
+        # only (~1.6% of them are in fact latent test positives - a
+        # realistic, slightly conservative negative distribution; NOT an
+        # oracle non-edge filter).
+        unobs_idx = (~train_adj)[tri_i, tri_j].nonzero().squeeze(1)
+        n_neg = min(n_train * 2, unobs_idx.numel())
+        sel = torch.randperm(unobs_idx.numel(), device=DEVICE, generator=rng)[:n_neg]
+        neg_pairs = torch.stack([tri_i[unobs_idx[sel]], tri_j[unobs_idx[sel]]])
+        X = torch.cat([pair_feats(train_pairs[0], train_pairs[1], deg_adj=1),
                        pair_feats(neg_pairs[0], neg_pairs[1])])
         y = torch.cat([torch.ones(n_train, device=DEVICE), torch.zeros(n_neg, device=DEVICE)])
 

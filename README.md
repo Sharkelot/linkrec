@@ -10,10 +10,14 @@ repeatable, seed-42 pipelines:
 2. **RecBole recommendation** (ML-100k) — LightGCN with a **chronological
    per-user 80/10/10 split** (no future leakage), full top-10 ranking
    evaluation: NDCG@10, Recall@10, MRR.
-3. **Synthetic B2B graph with ground truth** — 3,000 companies, 90k true
-   relationships; 20% held out as *latent* edges. This is where
-   "likely useful but unconnected" is a measurable ground truth. Four models
+3. **Synthetic B2B graph with ground truth** — 3,000 companies; edge
+   probability driven by observed features (sector/region/size) plus an
+   unobserved affinity vector. 20% of true edges are held out as *latent*
+   edges — the ground truth for "likely useful but unconnected". Four models
    compete, including a ranker over **relationship-specific pair features**.
+   Two calibrations: observable (359,605 true edges, 71,921 latent) and an
+   unlearnable control (90,308 true edges, 18,061 latent) where the
+   unobserved vector dominates.
 
 Served through FastAPI behind a Cloudflare tunnel, with per-request latency
 tracking and a local-LLM `/explain` endpoint.
@@ -31,15 +35,19 @@ tracking and a local-LLM `/explain` endpoint.
 
 | model | AUC (uniform negs) | MRR (uniform) | AUC (hard same-topic) | MRR (hard) | R@1 | R@5 | R@10 | R@20 |
 |---|---|---|---|---|---|---|---|---|
-| GraphSAGE (trained) | **0.8874** | 0.3545 | 0.7716 | 0.2364 | 0.032 | 0.116 | 0.168 | 0.244 |
-| feature cosine (no graph) | 0.7976 | 0.3481 | 0.7860 | 0.3602 | 0.063 | 0.134 | 0.177 | 0.225 |
-| Adamic-Adar (common nbrs) | 0.6495 | **0.7658** | 0.6493 | **0.8512** | 0.051 | 0.141 | 0.194 | **0.241** |
+| GraphSAGE (trained) | 0.7946 | 0.3521 | **0.7781** | 0.2675 | 0.050 | 0.138 | 0.190 | 0.246 |
+| feature cosine (no graph) | **0.8028** | 0.3523 | 0.7399 | 0.2474 | 0.064 | 0.135 | 0.182 | 0.234 |
+| Adamic-Adar (common nbrs) | 0.6939 | **0.8162** | 0.6763 | **0.6423** | **0.112** | **0.258** | **0.322** | **0.349** |
 
-Read: the GNN embedding improves *discrimination* (AUC) over both non-learned
-baselines; on this sparse graph, common-neighbor structure is a surprisingly
-strong top-k locator (full-ranking R@10). Full-ranking Recall@k (no negative
-sampling) is the most robust column; sampled MRR treats ties in favor of the
-positive (a known convention that flatters sparse zero-scored baselines).
+Read (v2, corrected protocol): with edge-excluding negative sampling and
+bidirectional message passing, the GNN's AUC edge over raw feature cosine
+mostly disappears on Cora (0.795 vs 0.803) — feature-level topic similarity
+is a very strong signal on this graph. Correct Adamic-Adar is the strongest
+full-ranking top-k locator here (R@10 0.322, R@1 0.112). Full-ranking
+Recall@k (no negative sampling) is the most robust column; sampled MRR
+treats ties in favor of the positive (a known convention that flatters
+sparse zero-scored baselines). The GNN's value shows up where graph
+structure carries relationship signal — the B2B experiment below.
 
 ### Recommendations — ML-100k (chronological split, full ranking, top-10)
 
@@ -62,30 +70,74 @@ affinity vector **z** (unobserved). 20% of the true edges are held out as
 
 | model | regime | AUC (full) | P@1 | P@10 | P@100 | R@10 |
 |---|---|---|---|---|---|---|
-| **pair ranker (rel.-feature MLP)** | observable | **0.646** | **1.000** | **0.400** | 0.140 | 0.023 |
-| GraphSAGE cosine | observable | 0.590 | 0.000 | 0.200 | 0.160 | 0.022 |
-| feature cosine | observable | 0.590 | 1.000 | 0.200 | 0.150 | 0.024 |
-| Adamic-Adar | observable | 0.611 | 0.000 | 0.100 | 0.130 | 0.014 |
-| pair ranker | unlearnable (control) | 0.588 | 0.000 | 0.000 | 0.010 | 0.013 |
+| **pair ranker (rel.-feature MLP)** | observable | **0.644** | 0.000 | **0.300** | 0.110 | 0.023 |
+| Adamic-Adar | observable | 0.611 | 0.000 | 0.000 | 0.130 | 0.013 |
+| feature cosine | observable | 0.590 | 1.000 | 0.200 | **0.150** | **0.024** |
+| GraphSAGE cosine | observable | 0.586 | 0.000 | 0.300 | 0.140 | 0.022 |
+| pair ranker | unlearnable (control) | 0.589 | 0.000 | 0.000 | 0.020 | 0.013 |
 | feature cosine | unlearnable (control) | 0.551 | 0.000 | 0.000 | 0.020 | 0.013 |
-| GraphSAGE cosine | unlearnable (control) | 0.540 | 0.000 | 0.000 | 0.000 | 0.007 |
-| Adamic-Adar | unlearnable (control) | 0.514 | 0.000 | 0.000 | 0.000 | 0.004 |
+| GraphSAGE cosine | unlearnable (control) | 0.522 | 0.000 | 0.000 | 0.010 | 0.006 |
+| Adamic-Adar | unlearnable (control) | 0.518 | 0.000 | 0.000 | 0.000 | 0.004 |
 
 Base rate in the observable regime: 71,921 latent / 4.48M candidates ≈ 1.6%.
 
-**Reading the results.**
-- **Observable regime:** the feature-aware pair ranker beats everything on
-  AUC (0.646) and top-k precision (P@10 = 0.40, i.e. 25× base rate; P@1 = 1.0).
-  Its top unconnected pairs are exactly the "likely useful" profile:
-  same sector + same region (e.g. Energy/Highland ↔ Energy/Highland).
-  6/20 of its top-20 are true latent edges. The GNN embedding alone adds
-  little beyond the raw features here (AUC 0.590 = feature cosine); the
-  graph structure shows up mostly through common-neighbor signals.
-- **Control (unlearnable) regime:** when the unobserved z dominates, the same
-  models collapse to AUC 0.51-0.59 with 0/20 top-precision — the relationship
-  is genuinely unidentifiable from observed data. Same models, same code;
-  only the data calibration differs. That gap *is* the measurement of how
-  much observable signal the task contains.
+**Reading the results (v2, corrected protocol).**
+- **Observable regime:** the feature-aware pair ranker still wins on AUC
+  (0.644) and matches the GNN on P@10 (0.30 ≈ 19× base rate); under the
+  realistic negative protocol (negatives drawn from unobserved pairs, not an
+  oracle non-edge filter) its P@1 no longer lands (0.0 vs 1.0 in v1) — a
+  more conservative, less flattered estimate. 6/20 of its top-20 unconnected
+  pairs are true latent edges, and they are exactly the "likely useful"
+  profile: same sector + same region. The GNN embedding alone is on par with
+  raw feature cosine (0.586 vs 0.590); graph structure's contribution is
+  mostly mediated through the common-neighbor and degree features.
+- **Control (unlearnable) regime:** when the unobserved z dominates, the
+  same models + fixed pipeline collapse to AUC 0.52-0.59 with 0/20
+  top-precision — the relationship is genuinely unidentifiable from observed
+  data. Same code; only the data calibration differs. That gap *is* the
+  measurement of how much observable signal the task contains.
+
+## Benchmark protocol (v2 — corrected evaluation)
+
+After a code review of the v1 code, four methodological issues were found
+and fixed; all numbers above are from the v2 pipeline (seed 42, re-run):
+
+1. **Negative-sample pairing.** v1 concatenated uniform + hard negative
+   tensors along the batch dimension while repeating source nodes per
+   example, which attached one edge's negatives to a different edge.
+   Negatives are now concatenated along the sample dimension
+   (`torch.cat([...], dim=1).view(-1)`) so each source keeps its own
+   negatives, in training and in sampled MRR/AUC.
+2. **Adamic-Adar formula.** v1 weighted the *endpoints*
+   (`diag(w) @ A @ Aᵀ @ diag(w)`); true Adamic-Adar weights the *common
+   neighbors*: `aa[u,v] = Σ_c 1/log(deg(c)) = A @ diag(w) @ Aᵀ`.
+3. **Ranker train/test separation.** v1 selected ranker negatives from the
+   oracle non-edge mask (which knew the latent edges) and used degrees that
+   included the target edge. v2 samples ranker negatives from **unobserved
+   pairs using training-time information only** (~1.6% of them are in fact
+   latent test positives — a realistic, slightly *conservative* negative
+   distribution), and corrects positive-pair degrees with the edge-removal
+   convention (the direct edge contributes 1 to each endpoint's degree;
+   common-neighbors is provably unaffected).
+4. **Cora evaluation cleanup.** The message-passing graph is now
+   bidirectional (one orientation per undirected train edge in v1); offline
+   top-pair generation explicitly masks known edges (train + held-out +
+   self), not just duplicate-feature pairs; and the full-ranking Recall@k
+   candidate set now includes other held-out edges (they compete, as they
+   do in the real task).
+
+Additionally, all uniform negative sampling (training and evaluation, both
+graphs) now rejects train-neighbors, self, and the positive's destination —
+no false negatives.
+
+Known remaining limitations (documented, not fixed):
+- GNN link-prediction embeddings are trained on the train graph, so pair
+  scores for held-out edges see structure that includes the train edges of
+  the endpoints (standard for GNN link prediction; per-edge removal is
+  infeasible at this scale).
+- Sampled MRR treats a tie in favor of the positive (common convention).
+- B2B sampled negatives can contain latent edges of the same source
+  (realistic deployment condition, conservative direction).
 
 ## Endpoints
 
